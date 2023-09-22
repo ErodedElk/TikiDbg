@@ -4,12 +4,22 @@
 #include <unordered_map>
 #include"TikiReg.h"
 #include <iomanip>
-#include"elf++.hh"
-#include"dwarf++.hh"
+#include"libelfin/elf/elf++.hh"
+#include"libelfin/dwarf/dwarf++.hh"
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include<fstream>
 
 class TikiDbg{
     public:
-        TikiDbg(std::string program,pid_t pid): program_name{std::move(program)},pid_me{pid}{}
+        TikiDbg(std::string program,pid_t pid): program_name{std::move(program)},pid_me{pid}{
+            auto fd = open(program_name.c_str(),0);
+            // create_mmap_loader: args is UNIX file descriptor
+            // open is used  instead of std::ifstream
+            //elf_me = elf::elf{elf::create_mmap_loader(fd)};
+            //dwarf_me= dwarf::dwarf{dwarf::elf::create_loader(elf_me)};
+        }
 
         void run();
         void handle_command(const std::string &line);
@@ -28,17 +38,156 @@ class TikiDbg{
         void step_over_breakpoint();
         void wait_for_signal();
 
+        // dwarf::die get_function_from_pc(uint64_t pc);
+        // dwarf::line_table::iterator get_line_entry_from_pc(uint64_t pc);
+        void initialise_load_address();
+        uint64_t offset_load_address(uint64_t addr);
+        void print_source(const std::string & fimename,unsigned line,unsigned n_lines_context);
+
+        siginfo_t get_signal_info();
+        void handle_sigtrap(siginfo_t info);
 
     private:
         std::string program_name;
         pid_t pid_me;
         std::unordered_map<std::intptr_t,Tikibreakpoint> t_breakpoints;
+
+        dwarf::dwarf dwarf_me;
+        elf::elf elf_me;
+        uint64_t binary_addr_base;
 };
+
+void TikiDbg::handle_sigtrap(siginfo_t info)
+{
+    switch (info.si_code) {
+        //one of these will be set if a breakpoint was hit
+        case SI_KERNEL:
+        case TRAP_BRKPT:
+        {
+            // set_pc(get_pc()-1); //put the pc back where it should be
+            std::cout << "Hit breakpoint at address 0x" << std::hex << get_pc() << std::endl;
+            // auto offset_pc = offset_load_address(get_pc()); //rember to offset the pc for querying DWARF
+            // auto line_entry = get_line_entry_from_pc(offset_pc);
+            // print_source(line_entry->file->path, line_entry->line,5);
+            // return;
+        }
+        //this will be set if the signal was sent by single stepping
+        case TRAP_TRACE:
+            return;
+        default:
+            std::cout << "Unknown SIGTRAP code " << info.si_code << std::endl;
+            return;
+    }
+}
+
+siginfo_t TikiDbg::get_signal_info()
+{
+    siginfo_t info;
+    ptrace(PTRACE_GETSIGINFO,pid_me,nullptr,&info);
+    return info;
+}
+
+void TikiDbg::print_source(const std::string & filename,unsigned line,unsigned n_lines_context)
+{
+    std::ifstream file{filename};
+    auto start_line= line <= n_lines_context? 1: line-n_lines_context;
+    auto end_line= line +n_lines_context + (line< n_lines_context? n_lines_context-line: 0)+1;
+    char c{};
+    auto current=1u;
+    while(current != start_line && file.get(c))
+    {
+        if(c == '\n')
+        {
+            ++current;
+        }
+    }
+
+    std::cout << (current == line? "> " : " ");
+    while (current <=end_line && file.get(c))
+    {
+        std::cout << c;
+        if(c == '\n')
+        {
+            ++current;
+            std::cout << (current == line? "> " : " ");
+        }
+    }
+    std::cout << std::endl;
+}
+
+uint64_t TikiDbg::offset_load_address(uint64_t addr)
+{
+    return addr- binary_addr_base;
+}
+
+void TikiDbg::initialise_load_address()
+{
+    std::ifstream map("/proc/"+ std::to_string(pid_me)+"/maps");
+    std::string addr;
+    std::getline(map, addr,'-');
+    binary_addr_base = std::stoll(addr, 0, 16);
+}
+
+// dwarf::line_table::iterator TikiDbg::get_line_entry_from_pc(uint64_t pc)
+// {
+//     for(auto & cu : dwarf_me.compilation_units())
+//     {
+//         if(die_pc_range(cu.root()).contains(pc))
+//         {
+//             auto & lt= cu.get_line_table();
+//             auto it =lt.find_address(pc);
+//             if(it == lt.end())
+//             {
+//                 throw std::out_of_range{"Cannot find line"};
+//             }
+//             else{
+//                 return it;
+//             }
+//         }
+//     }
+//     throw std::out_of_range{"Cannot find line"};
+// }
+
+// dwarf::die TikiDbg::get_function_from_pc(uint64_t pc)
+// {
+//     for(auto & cu:dwarf_me.compilation_units())
+//     {
+//         if(die_pc_range(cu.root()).contains(pc))
+//         {
+//             for(const auto & die:cu.root())
+//             {
+//                 if(die.tag == dwarf::DW_TAG::subprogram)
+//                 {
+//                     if(die_pc_range(die).contains(pc))
+//                     {
+//                         return die;
+//                     }
+//                 }
+//             }
+//         }
+//     }
+//     throw std::out_of_range{"Cannot find function"};
+// }
+
 void TikiDbg::wait_for_signal()
 {
     int wait_status;
     auto options=0;
     waitpid(pid_me,&wait_status,options);
+
+
+    auto siginfo = get_signal_info();
+    switch (siginfo.si_signo) {
+    case SIGTRAP:
+        handle_sigtrap(siginfo);
+        break;
+    case SIGSEGV:
+        std::cout << "segfault. Reason: " << siginfo.si_code << std::endl;
+        break;
+    default:
+        std::cout << "Got signal " << strsignal(siginfo.si_signo) << std::endl;
+    }
+
 }
 
 void TikiDbg::step_over_breakpoint()
@@ -116,10 +265,8 @@ void TikiDbg::delete_breakpoint_at_addr(std::intptr_t addr)
 
 void TikiDbg::run()
 {
-    int wait_status = 0;
-    auto options=0;
-    waitpid(pid_me, &wait_status,options);
-    
+    wait_for_signal();
+    initialise_load_address();
     char *line =nullptr;
     while((line=linenoise("TikiDbg> "))!=nullptr)
     {
@@ -148,7 +295,16 @@ void TikiDbg::handle_command(const std::string& line)
         if(args.size() == 2)
         {
             std::string addr {args[1]};
-            set_breakpoint_at_addr(std::stoll(addr,0,16));
+            uint64_t target_addr=0;
+            if(addr[0]=='*')
+            {//rebase address
+                addr.erase(addr.begin());
+                target_addr += std::stoll(addr,0,16)+binary_addr_base;
+            }
+            else{
+                target_addr+=std::stoll(addr,0,16);
+            }
+            set_breakpoint_at_addr(target_addr);
         }
         else{
             std::cerr << "Unknown command " << command << std::endl;

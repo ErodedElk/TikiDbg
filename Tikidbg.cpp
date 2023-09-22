@@ -10,7 +10,8 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include<fstream>
-
+#include<capstone/capstone.h>
+#include <sys/uio.h>
 class TikiDbg{
     public:
         TikiDbg(std::string program,pid_t pid): program_name{std::move(program)},pid_me{pid}{
@@ -36,6 +37,7 @@ class TikiDbg{
         void set_pc(uint64_t value){set_register_value(pid_me,reg::rip,value);};
 
         void step_over_breakpoint();
+        void single_step_instruction_with_breakpoint_check();
         void wait_for_signal();
 
         // dwarf::die get_function_from_pc(uint64_t pc);
@@ -43,6 +45,8 @@ class TikiDbg{
         void initialise_load_address();
         uint64_t offset_load_address(uint64_t addr);
         void print_source(const std::string & fimename,unsigned line,unsigned n_lines_context);
+        void print_disassembly(uint64_t addr,uint64_t size,size_t n_code);
+
 
         siginfo_t get_signal_info();
         void handle_sigtrap(siginfo_t info);
@@ -55,7 +59,62 @@ class TikiDbg{
         dwarf::dwarf dwarf_me;
         elf::elf elf_me;
         uint64_t binary_addr_base;
+        csh cs_handle;
 };
+
+void TikiDbg::single_step_instruction_with_breakpoint_check()
+{
+    if (t_breakpoints.count(get_pc()-1)) {
+
+        //set_pc(get_pc()-1);
+        step_over_breakpoint();
+    }
+    else {
+        ptrace(PTRACE_SINGLESTEP, pid_me, nullptr, nullptr);
+        wait_for_signal();
+    }
+}
+
+void TikiDbg::print_disassembly(uint64_t addr,uint64_t size,size_t n_code)
+{
+    cs_insn *insn;
+	size_t count;
+    struct iovec local[1];
+    struct iovec remote[1];
+    
+    uint8_t buf1[0x100];
+
+    ssize_t nread;
+
+    local[0].iov_base = buf1;
+    local[0].iov_len = 0x100-1;
+
+    remote[0].iov_base = reinterpret_cast<void*>(addr);
+    remote[0].iov_len = size;
+    nread = process_vm_readv(pid_me, local, 1, remote, 1, 0);
+
+    if(t_breakpoints.count(addr))
+    {
+        auto & bp=t_breakpoints[addr];
+        
+        buf1[0]=bp.get_save_byte();
+    }
+
+    count = cs_disasm(cs_handle, buf1, 255, addr, n_code, &insn);
+    if(count > 0)
+    {
+        std::cout << "----------------TikiDbg----------------" << std::endl ;
+        for(int i=0; i<count; i++)
+        {
+            std::cout << "0x" << std::hex << insn[i].address << ":\t" << insn[i].mnemonic << "\t\t" << insn[i].op_str << std::endl;
+        }
+        cs_free(insn, count);
+    }
+    else{
+        throw std::runtime_error("Disassembly failed");
+    }
+}
+
 
 void TikiDbg::handle_sigtrap(siginfo_t info)
 {
@@ -65,15 +124,22 @@ void TikiDbg::handle_sigtrap(siginfo_t info)
         case TRAP_BRKPT:
         {
             // set_pc(get_pc()-1); //put the pc back where it should be
-            std::cout << "Hit breakpoint at address 0x" << std::hex << get_pc() << std::endl;
+            std::cout << "Hit breakpoint at address 0x" << std::hex << get_pc()-1 << std::endl;
             // auto offset_pc = offset_load_address(get_pc()); //rember to offset the pc for querying DWARF
             // auto line_entry = get_line_entry_from_pc(offset_pc);
-            // print_source(line_entry->file->path, line_entry->line,5);
-            // return;
+            uint64_t now_pc= get_pc()-1;
+            print_disassembly(now_pc,0x50,7);
+            return;
         }
         //this will be set if the signal was sent by single stepping
         case TRAP_TRACE:
+        {
+            uint64_t now_pc= get_pc();
+            print_disassembly(now_pc,0x50,7);
             return;
+        }
+
+            
         default:
             std::cout << "Unknown SIGTRAP code " << info.si_code << std::endl;
             return;
@@ -200,7 +266,7 @@ void TikiDbg::step_over_breakpoint()
         {
             set_pc(breakpoint_addr);
             bp.disable();
-            ptrace(PTRACE_SINGLEBLOCK,pid_me,nullptr,nullptr);
+            ptrace(PTRACE_SINGLESTEP,pid_me,nullptr,nullptr);
             wait_for_signal();
             bp.enable();
         }
@@ -265,6 +331,10 @@ void TikiDbg::delete_breakpoint_at_addr(std::intptr_t addr)
 
 void TikiDbg::run()
 {
+    if (cs_open(CS_ARCH_X86, CS_MODE_64, &cs_handle) != CS_ERR_OK)
+        throw std::runtime_error{"Couldn't open capstone"};
+    
+
     wait_for_signal();
     initialise_load_address();
     char *line =nullptr;
@@ -378,6 +448,40 @@ void TikiDbg::handle_command(const std::string& line)
                 std::setfill('0') << std::setw(16)<< read_memory(addr_) << std::endl;
         }
     }
+    else if(is_prefix(command,"instep"))
+    {
+        single_step_instruction_with_breakpoint_check();
+    }
+    else if(is_prefix(command,"next"))
+    {
+        if( (read_memory(get_pc())&0xff) != 0xe8)
+        {
+            single_step_instruction_with_breakpoint_check();
+        }
+        else{
+            uint8_t little_buf[16];
+            uint64_t* temp_pointer=reinterpret_cast<uint64_t*>(little_buf);
+            cs_insn *insn;
+            uint64_t now_pc=get_pc();
+            temp_pointer[0]=read_memory(now_pc);
+            temp_pointer[1]=read_memory(now_pc+8);
+
+            size_t count = cs_disasm(cs_handle, little_buf, 255, get_pc(), 2, &insn);
+            if(count>0)
+            {
+                if(!std::strcmp(insn[0].mnemonic,"call"))
+                {
+                    set_breakpoint_at_addr(insn[1].address);
+                    continue_execution();
+                    delete_breakpoint_at_addr(insn[1].address);
+                    set_pc(get_pc()-1);
+                }
+                cs_free(insn,count);
+            }
+        }
+
+    }
+
     else{
         std::cerr << "Unknown command " << command << std::endl;
     }

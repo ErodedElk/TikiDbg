@@ -20,7 +20,7 @@ class Tikibreakpoint{
 
         auto is_enabled() const -> bool { return enabled;}
         auto get_addr() const -> std::intptr_t{return b_addr;}
-
+        auto get_save_byte() const -> uint8_t{return save_byte;};
 
 
     private:
